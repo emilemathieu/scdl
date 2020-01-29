@@ -1,7 +1,8 @@
 # -*- encoding: utf-8 -*-
 
 import requests
-from scdl import CLIENT_ID
+# from scdl import CLIENT_ID
+from .conf import CLIENT_ID
 
 
 class Client():

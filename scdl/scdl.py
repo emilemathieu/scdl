@@ -65,13 +65,18 @@ import tempfile
 import codecs
 import shlex
 
+from collections import OrderedDict
+
 import configparser
 import mutagen
 from docopt import docopt
 from clint.textui import progress
 
-from scdl import __version__, CLIENT_ID, ALT_CLIENT_ID
-from scdl import client, utils
+# from scdl import __version__, CLIENT_ID, ALT_CLIENT_ID
+# from scdl import client, utils
+from .conf import __version__, CLIENT_ID, ALT_CLIENT_ID
+from .client import Client
+from .utils import *
 
 from datetime import datetime
 import subprocess
@@ -80,10 +85,10 @@ logging.basicConfig(level=logging.INFO, format='%(message)s')
 logging.getLogger('requests').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-logger.addFilter(utils.ColorizeFilter())
+logger.addFilter(ColorizeFilter())
 
 arguments = None
-token = ''
+token = '' # can be obtain at https://mopidy.com/ext/soundcloud/#authentication
 path = ''
 offset = 1
 
@@ -104,9 +109,16 @@ url = {
     'user': ('https://api.soundcloud.com/users/{0}'),
     'me': ('https://api.soundcloud.com/me?oauth_token={0}')
 }
-client = client.Client()
+client = Client()
 
 fileToKeep = []
+
+codecs = {
+    'mp3': {'ext': 'mp3', 'abr': 128},
+    'aac': {'ext': 'm4a', 'abr': 256},
+    'opus': {'ext': 'ogg', 'abr': 64},
+    'flac': {'ext': 'flac'},
+}
 
 
 def main():
@@ -143,7 +155,7 @@ def main():
 
     if arguments['--min-size'] is not None:
         try:
-            arguments['--min-size'] = utils.size_in_bytes(
+            arguments['--min-size'] = size_in_bytes(
                 arguments['--min-size']
             )
         except:
@@ -155,7 +167,7 @@ def main():
 
     if arguments['--max-size'] is not None:
         try:
-            arguments['--max-size'] = utils.size_in_bytes(
+            arguments['--max-size'] = size_in_bytes(
                 arguments['--max-size']
             )
         except:
@@ -315,7 +327,13 @@ def get_track_info(track_id):
     """
     logger.info('Retrieving more info on the track')
     info_url = url["trackinfo"].format(track_id)
-    r = requests.get(info_url, params={'client_id': CLIENT_ID}, stream=True)
+    # r = requests.get(info_url, params={'client_id': CLIENT_ID}, stream=True)
+    try:
+        r = requests.get(info_url, params={'client_id': CLIENT_ID}, headers={'Authorization': 'OAuth ' + token}, stream=True)
+        r.raise_for_status()
+    except requests.exceptions.HTTPError as err:
+        print(err)
+        sys.exit(1)
     item = r.json()
     logger.debug(item)
     return item
@@ -424,11 +442,11 @@ def get_filename(track, original_filename=None):
 
         title = str(int(ts)) + "_" + title
 
-    ext = ".mp3"
+    # ext = ".mp3"
     if original_filename is not None:
         original_filename.encode('utf-8', 'ignore').decode('utf8')
-        ext = os.path.splitext(original_filename)[1]
-    filename = title[:251] + ext.lower()
+        # ext = os.path.splitext(original_filename)[1]
+    filename = title[:251]# + ext.lower()
     filename = ''.join(c for c in filename if c not in invalid_chars)
     return filename
 
@@ -443,11 +461,11 @@ def download_original_file(track, title):
     )
     if r.status_code == 401:
         logger.info('The original file has no download left.')
-        return None
+        return None, None
     
     if r.status_code == 404:
         logger.info('Could not get name from stream - using basic name')
-        return None
+        return None, None
 
     # Find filename
     d = r.headers.get('content-disposition')
@@ -473,7 +491,7 @@ def download_original_file(track, title):
                 received += len(chunk)
                 f.write(chunk)
                 f.flush()
-
+    codec = 'mp3'
     if received != total_length:
         logger.error('connection closed prematurely, download incomplete')
         sys.exit()
@@ -481,6 +499,7 @@ def download_original_file(track, title):
     shutil.move(temp.name, os.path.join(os.getcwd(), filename))
     if arguments['--flac'] and can_convert(filename):
         logger.info('Converting to .flac...')
+        codec = 'flac'
         newfilename = filename[:-4] + ".flac"
         new = shlex.quote(newfilename)
         old = shlex.quote(filename)
@@ -491,35 +510,48 @@ def download_original_file(track, title):
         os.remove(filename)
         filename = newfilename
 
-    return filename
+    return filename, codec
 
 
 def get_track_m3u8(track):
-    url = None
+    urls = OrderedDict([('opus', None), ('mp3', None), ('aac', None)])
+    codec, url = None, None
+
     for transcoding in track['media']['transcodings']:
-        if transcoding['format']['protocol'] == 'hls' \
-                and transcoding['format']['mime_type'] == 'audio/mpeg':
-            url = transcoding['url']
+        if transcoding['format']['protocol'] != 'hls': continue
+        if transcoding['preset'] in ('aac_1_0', 'aac_hq'):
+            urls['aac'] = transcoding['url']
+        if transcoding['preset'] in ('mp3_0', 'mp3_0_0'):
+            urls['mp3'] = transcoding['url']
+        if transcoding['preset'] in ('opus_0', 'opus_0_0'):
+            urls['opus'] = transcoding['url']
+
+    for key, value in urls.items():
+        if value is not None:
+            codec = key
+            url = value
 
     if url is not None:
-        r = requests.get(url, params={'client_id': CLIENT_ID})
+        r = requests.get(url, params={'client_id': CLIENT_ID}, headers={'Authorization': 'OAuth ' + token})
         logger.debug(r.url)
-        return r.json()['url']
+        return r.json()['url'], codec
 
 
-def download_hls_mp3(track, title):
-    filename = get_filename(track)
-    logger.debug("filename : {0}".format(filename))
+def download_hls(track, title):
+    filename_wo_ext = get_filename(track)
+    logger.debug("filename_wo_ext : {0}".format(filename_wo_ext))
     # Skip if file ID or filename already exists
-    if already_downloaded(track, title, filename):
-        return filename
-
+    for codec in codecs.keys():
+        filename = filename_wo_ext + '.' + codecs[codec]['ext']
+        if already_downloaded(track, title, filename):
+            return filename, codec
     # Get the requests stream
-    url = get_track_m3u8(track)
+    url, codec = get_track_m3u8(track)
+    filename = filename_wo_ext + '.' + codecs[codec]['ext']
     filename_path = os.path.abspath(filename)
 
     subprocess.call(['ffmpeg', '-i', url, '-c', 'copy', filename_path, '-loglevel', 'fatal'])
-    return filename
+    return filename, codec
 
 
 def download_track(track, playlist_name=None, playlist_file=None):
@@ -540,10 +572,9 @@ def download_track(track, playlist_name=None, playlist_file=None):
     # Downloadable track
     filename = None
     if track['downloadable'] and not arguments['--onlymp3']:
-        filename = download_original_file(track, title)
-
+        filename, codec = download_original_file(track, title)
     if filename is None:
-        filename = download_hls_mp3(track, title)
+        filename, codec = download_hls(track, title)
 
     # Add the track to the generated m3u playlist file
     if playlist_file:
@@ -557,12 +588,12 @@ def download_track(track, playlist_name=None, playlist_file=None):
     if arguments['--remove']:
         fileToKeep.append(filename)
 
-    if filename.endswith('.mp3') or filename.endswith('.flac'):
-        try:
-            set_metadata(track, filename, playlist_name)
-        except Exception as e:
-            logger.error('Error trying to set the tags...')
-            logger.debug(e)
+    if filename.endswith('.mp3') or filename.endswith('.m4a') or filename.endswith('.ogg') or filename.endswith('.flac'):
+        # try:
+        set_metadata(track, filename, codec, playlist_name)
+        # except Exception as e:
+            # logger.error('Error trying to set the tags...')
+            # logger.debug(e)
     else:
         logger.error("This type of audio doesn't support tagging...")
 
@@ -653,7 +684,7 @@ def record_download_archive(track):
         logger.debug(ioe)
 
 
-def set_metadata(track, filename, album=None):
+def set_metadata(track, filename, codec, album=None):
     """
     Sets the mp3 file metadata using the Python module Mutagen
     """
@@ -689,7 +720,7 @@ def set_metadata(track, filename, album=None):
         audio['artist'] = track['artist']
         if album: audio['album'] = album
         if track['genre']: audio['genre'] = track['genre']
-        if track['permalink_url']: audio['website'] = track['permalink_url']
+        # if track['permalink_url']: audio['website'] = track['permalink_url']
         if track['date']: audio['date'] = track['date']
         audio.save()
 
@@ -701,6 +732,11 @@ def set_metadata(track, filename, album=None):
                 a['COMM'] = mutagen.id3.COMM(
                     encoding=3, lang=u'ENG', text=track['description']
                 )
+            elif a.__class__ == mutagen.mp4.MP4:
+                a['COMM'] = mutagen.id3.COMM(
+                    encoding=3, lang=u'ENG', text=track['description']
+                )
+
         if artwork_url:
             if a.__class__ == mutagen.flac.FLAC:
                 p = mutagen.flac.Picture()
@@ -714,6 +750,11 @@ def set_metadata(track, filename, album=None):
                     encoding=3, mime='image/jpeg', type=3,
                     desc='Cover', data=out_file.read()
                 )
+            elif a.__class__ == mutagen.mp4.MP4:
+                a['covr'] = [
+                mutagen.mp4.MP4Cover(out_file.read(), imageformat=mutagen.mp4.MP4Cover.FORMAT_JPEG)
+                ]
+
         a.save()
 
 
