@@ -113,7 +113,7 @@ client = Client()
 
 fileToKeep = []
 
-codecs = {
+codec_dict = {
     'mp3': {'ext': 'mp3', 'abr': 128},
     'aac': {'ext': 'm4a', 'abr': 256},
     'opus': {'ext': 'ogg', 'abr': 64},
@@ -332,8 +332,11 @@ def get_track_info(track_id):
         r = requests.get(info_url, params={'client_id': CLIENT_ID}, headers={'Authorization': 'OAuth ' + token}, stream=True)
         r.raise_for_status()
     except requests.exceptions.HTTPError as err:
-        print(err)
-        sys.exit(1)
+        try:
+            r = requests.get(info_url, params={'client_id': CLIENT_ID}, stream=True)
+        except requests.exceptions.HTTPError as err:
+            print(err)
+            sys.exit(1)
     item = r.json()
     logger.debug(item)
     return item
@@ -521,7 +524,7 @@ def get_track_m3u8(track):
         if transcoding['format']['protocol'] != 'hls': continue
         if transcoding['preset'] in ('aac_1_0', 'aac_hq'):
             urls['aac'] = transcoding['url']
-        if transcoding['preset'] in ('mp3_0', 'mp3_0_0'):
+        if transcoding['preset'] in ('mp3_0', 'mp3_0_0', 'mp3_0_1'):
             urls['mp3'] = transcoding['url']
         if transcoding['preset'] in ('opus_0', 'opus_0_0'):
             urls['opus'] = transcoding['url']
@@ -532,7 +535,15 @@ def get_track_m3u8(track):
             url = value
 
     if url is not None:
-        r = requests.get(url, params={'client_id': CLIENT_ID}, headers={'Authorization': 'OAuth ' + token})
+        try:
+            r = requests.get(url, params={'client_id': CLIENT_ID}, headers={'Authorization': 'OAuth ' + token})
+            r.raise_for_status()
+        except requests.exceptions.HTTPError as err:
+            try:
+                r = requests.get(url, params={'client_id': CLIENT_ID}, stream=True)
+            except requests.exceptions.HTTPError as err:
+                print(err)
+                sys.exit(1)
         logger.debug(r.url)
         return r.json()['url'], codec
 
@@ -541,13 +552,13 @@ def download_hls(track, title):
     filename_wo_ext = get_filename(track)
     logger.debug("filename_wo_ext : {0}".format(filename_wo_ext))
     # Skip if file ID or filename already exists
-    for codec in codecs.keys():
-        filename = filename_wo_ext + '.' + codecs[codec]['ext']
+    for codec in codec_dict.keys():
+        filename = filename_wo_ext + '.' + codec_dict[codec]['ext']
         if already_downloaded(track, title, filename):
             return filename, codec
     # Get the requests stream
     url, codec = get_track_m3u8(track)
-    filename = filename_wo_ext + '.' + codecs[codec]['ext']
+    filename = filename_wo_ext + '.' + codec_dict[codec]['ext']
     filename_path = os.path.abspath(filename)
 
     subprocess.call(['ffmpeg', '-i', url, '-c', 'copy', filename_path, '-loglevel', 'fatal'])
